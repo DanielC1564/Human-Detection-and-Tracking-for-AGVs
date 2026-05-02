@@ -28,6 +28,45 @@ This project implements a real-time human detection and tracking system intended
 ---
 
 ## System Architecture
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            Raspberry Pi 5                               │
+│                                                                         │
+│          ┌──────────────────────────────────────────────┐               │
+│          │           Sensor Fusion Code System          │               │
+│          └───────────────────┬──────────────────────────┘               │
+│                              │                                          │
+│              ┌───────────────┴───────────────┐                          │
+│              │                               │                          │
+│   ┌──────────▼──────────┐       ┌────────────▼────────┐                 │
+│   │   Camera Software   │       │  UART Serial        │                 │
+│   │  • Picamera 2       │       │  Interface          │                 │
+│   │  • libcamera        │       └────────────┬────────┘                 │
+│   └──────────┬──────────┘                    │                          │
+│              │                               │                          │
+│   ┌──────────▼──────────┐       ┌────────────▼────────┐                 │
+│   │   Linux Drivers     │       │  Linux UART         │                 │
+│   │  • IMX500 Driver    │       │  Drivers            │                 │
+│   │  • CSI-2 Receiver   │       └────────────┬────────┘                 │
+│   └──────────┬──────────┘                    │                          │
+└──────────────┼───────────────────────────────┼──────────────────────────┘
+               │                               │
+    I2C:       │  MPI CSI-2:                   │ UART Serial
+  (Camera      │  (Image and AI Tensor)        │
+  Configs)     │                               │
+               │                               │
+┌──────────────┴──────────┐       ┌────────────┴────────────┐
+│  Raspberry Pi AI Camera │       │   RD-03D mmWave Radar   │
+│                         │       │                         │
+│  Outputs:               │       │  Output:                │
+│  • Image Frames         │       │  • Int 16 type binary   │
+│  • AI Accelerator       │       │    containing all       │
+│    Tensor               │       │    target information   │
+└─────────────────────────┘       └─────────────────────────┘
+```
+
+---
+
 ## File Descriptions
 ### Kalman Filter.py
 Contains two classes — `KalmanFilter` and `KalmanTracker` — that together implement a robust, gated Kalman tracking system for a single target.
@@ -68,6 +107,81 @@ A higher-level wrapper around `KalmanFilter` that adds:
 
 ---
 ### Sensor Fusion.py
+The main application file. Spawns two data collection threads, performs sensor fusion, and drives a `KalmanTracker` instance for each of up to three concurrent targets.
+
+#### Shared State
+
+| Variable | Type | Description |
+|---|---|---|
+| `t_radar` | `dict` (keys 1–3) | Each entry holds `valid`, `x`, `y`, `dist`, `angle`, `time` for one radar target |
+| `t_camera` | `list` | List of detection dicts containing `label`, `angle`, `conf` for the current camera frame |
+| `camera_lock` | `threading.Lock` | Protects `t_camera` from simultaneous read/write across threads |
+
+#### Thread 1 — `radar_collect()`
+
+Polls the RD-03D radar continuously. For each update cycle, reads up to three targets and populates `t_radar`. A target is only marked `valid` if its distance falls within **350 mm – 2500 mm**. The bearing of each target is computed as:
+
+```
+angle = degrees( atan( x / y ) )
+```
+
+The thread closes the radar connection safely via a `finally` block even if an exception occurs.
+
+#### Thread 2 — `camera_collect()`
+
+Runs the IMX500 detector and processes each frame. Camera constants:
+
+| Constant | Value | Description |
+|---|---|---|
+| `WIDTH` | 640 px | Frame width |
+| `FOV` | 75° | Horizontal field of view |
+| `DEG_PER_PIXEL` | `75 / 640` | Angular resolution per pixel |
+
+Only detections with **confidence > 0.5** are kept. For each qualifying detection the bounding box centre pixel is converted to a horizontal angle relative to the camera centre:
+
+```
+offset = center_x - 320
+angle  = offset × DEG_PER_PIXEL
+```
+
+The resulting list of `{label, angle, conf}` dicts is written to `t_camera` under `camera_lock`.
+
+#### `camera_radar_match(angle, detection_list)`
+
+Attempts to find a camera detection whose angle is within **20°** of a given radar target's angle, filtering only for `"person"` labels. Returns the closest angular match, or `None` if no detection falls within the gate.
+
+#### Sensor Fusion Logic (Main Loop)
+
+Runs at ~10 Hz. For each of the three target slots the fusion logic follows three paths:
+
+```
+Radar data recent (< 0.5s old) AND valid?
+│
+├── YES → use radar y as depth
+│         │
+│         ├── Camera angle match found within 20°?
+│         │   ├── YES → FUSED MODE
+│         │   │         x = radar_y × tan(camera_angle)
+│         │   │         y = radar_y
+│         │   │         (camera angle used — more precise than radar angle)
+│         │   │
+│         │   └── NO  → RADAR FALLBACK
+│         │             x = radar_x
+│         │             y = radar_y
+│         │
+│         └── Store y as last_known_y[i]
+│
+└── NO  → CAMERA ONLY MODE (Tracker 1 only)
+          If any camera detection exists:
+            x = last_known_y[i] × tan(camera_angle)
+            y = last_known_y[i]   ← depth memory from last radar reading
+```
+
+> **Note:** Camera-only fallback is only applied to **Tracker 1**. Trackers 2 and 3 require live radar data and are reset if the radar goes stale.
+
+Once `(raw_x, raw_y)` is resolved it is passed to the corresponding `KalmanTracker`. If the tracker is confirmed (`hit_streak ≥ 5`) the smoothed output is printed to console, distinguishing between `"person"` and inanimate object labels. If no input is found for a slot that tracker is reset.
+
+---
 
 ## Dependencies
 ### Raspberry Pi OS 
@@ -134,7 +248,7 @@ The key tunable parameters across both files are summarised below:
 | `P` (Initial Covariance) | `Kalman Filter.py` | `200 × I` | Higher values reflect greater uncertainty about the initial position |
 | `threshold` (Hit Streak) | `Kalman Filter.py` | `5` frames | Consecutive valid frames required before a target is confirmed |
 | Gating Distance | `Kalman Filter.py` | `800 mm` | Measurements further than this from the prediction are rejected post-confirmation |
-| Radar Distance Range | `Sensor Fusion.py` | `350 – 2500 mm` | Targets outside this range are marked invalid |
+| Radar Distance Range | `Sensor Fusion.py` | `350 – 5000 mm` | Targets outside this range are marked invalid |
 | Radar Staleness Timeout | `Sensor Fusion.py` | `0.5 s` | Radar data older than this is treated as absent |
 | Camera Confidence Threshold | `Sensor Fusion.py` | `0.5` | Detections below this confidence score are discarded |
 | Angle Matching Gate | `Sensor Fusion.py` | `20°` | Maximum angular difference allowed when matching a radar target to a camera detection |
