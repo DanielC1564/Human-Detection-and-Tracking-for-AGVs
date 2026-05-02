@@ -30,6 +30,43 @@ This project implements a real-time human detection and tracking system intended
 ## System Architecture
 ## File Descriptions
 ### Kalman Filter.py
+Contains two classes — `KalmanFilter` and `KalmanTracker` — that together implement a robust, gated Kalman tracking system for a single target.
+
+#### `KalmanFilter`
+
+A standard linear Kalman filter operating on a **4-dimensional state vector** representing position and velocity:
+
+```
+State vector x = [x_pos, y_pos, x_vel, y_vel]
+```
+
+| Matrix | Dimension | Description |
+|---|---|---|
+| `F` (State Transition) | 4×4 | Projects current state to next state; `dt` offsets are injected at runtime by `KalmanTracker` |
+| `H` (Measurement) | 2×4 | Extracts only `[x, y]` from the state — velocity is unobserved |
+| `P` (Covariance) | 4×4 | Initial uncertainty set to `200 × I` |
+| `R` (Measurement Noise) | 2×2 | Set to `80 × I` — suppresses the effect of sudden measurement jumps |
+| `Q` (Process Noise) | 4×4 | Set to `0.01 × I` — trusts the motion model closely between updates |
+
+**`predict()`** — Advances the state estimate and covariance forward using `F` and `Q`.
+
+**`update(measurement)`** — Takes a `[x, y]` measurement, computes the innovation, derives the Kalman gain `K`, and updates both the state estimate and uncertainty. Includes protection against singular matrix inversion.
+
+#### `KalmanTracker`
+
+A higher-level wrapper around `KalmanFilter` that adds:
+
+- **Time-based `dt`** — Computes elapsed time between calls and injects it into `F[0,2]` and `F[1,3]` so velocity terms correctly propagate position
+- **Gating** — After the startup phase, measurements more than **800 mm** from the predicted position are rejected to prevent track corruption from spurious detections. Rather than fully resetting the hit streak on a rejected frame, it is decremented by 1 so a single missed frame does not lose a confirmed track
+- **Hit streak confirmation** — A target must accumulate **5 consecutive valid updates** (`threshold = 5`) before `is_confirmed` returns `True` and its smoothed position is trusted by the main system. During the startup phase (streak below threshold), gating is intentionally relaxed to allow large initial position jumps
+
+| Method / Property | Description |
+|---|---|
+| `update(raw_x, raw_y)` | Runs predict → gate check → Kalman update; returns `(smooth_x, smooth_y)` |
+| `is_confirmed` | `True` once hit streak ≥ 5 |
+| `reset()` | Clears `initiated` flag and resets hit streak to 0 |
+
+---
 ### Sensor Fusion.py
 
 ## Dependencies
@@ -88,3 +125,18 @@ This line initialises the UART communication and is done differently on the Pi 5
 def __init__(self, uart_port='/dev/ttyS0', baudrate=256000, multi_mode=True):
 ```
 ## Configuration
+The key tunable parameters across both files are summarised below:
+
+| Parameter | File | Default | Description |
+|---|---|---|---|
+| `R` (Measurement Noise) | `Kalman Filter.py` | `80 × I` | Higher values make the filter trust measurements less and smooth more aggressively |
+| `Q` (Process Noise) | `Kalman Filter.py` | `0.01 × I` | Higher values allow the filter to adapt faster to rapid motion |
+| `P` (Initial Covariance) | `Kalman Filter.py` | `200 × I` | Higher values reflect greater uncertainty about the initial position |
+| `threshold` (Hit Streak) | `Kalman Filter.py` | `5` frames | Consecutive valid frames required before a target is confirmed |
+| Gating Distance | `Kalman Filter.py` | `800 mm` | Measurements further than this from the prediction are rejected post-confirmation |
+| Radar Distance Range | `Sensor Fusion.py` | `350 – 2500 mm` | Targets outside this range are marked invalid |
+| Radar Staleness Timeout | `Sensor Fusion.py` | `0.5 s` | Radar data older than this is treated as absent |
+| Camera Confidence Threshold | `Sensor Fusion.py` | `0.5` | Detections below this confidence score are discarded |
+| Angle Matching Gate | `Sensor Fusion.py` | `20°` | Maximum angular difference allowed when matching a radar target to a camera detection |
+| Camera FOV | `Sensor Fusion.py` | `75°` | Must match the physical field of view of the lens in use |
+| Loop / Thread Rate | `Sensor Fusion.py` | `10 Hz` | `time.sleep(0.1)` applied in both threads and the main loop |
