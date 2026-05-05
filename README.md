@@ -119,7 +119,7 @@ The main application file. Spawns two data collection threads, performs sensor f
 
 #### Thread 1 — `radar_collect()`
 
-Polls the RD-03D radar continuously. For each update cycle, reads up to three targets and populates `t_radar`. A target is only marked `valid` if its distance falls within **350 mm – 2500 mm**. The bearing of each target is computed as:
+Polls the RD-03D radar continuously. For each update cycle, reads up to three targets and populates `t_radar`. A target is only marked `valid` if its distance falls within **350 mm – 7000 mm**. The bearing of each target is computed as:
 
 ```
 angle = degrees( atan( x / y ) )
