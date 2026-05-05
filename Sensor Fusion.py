@@ -27,7 +27,7 @@ def radar_collect():
             if radar.update():
                 for i in range(1, 4):
                     target = radar.get_target(i)
-                    if target and 350 < target.distance < 5000:
+                    if target and 350 < target.distance < 7000:
                         t_radar[i]['valid'] = True
                         t_radar[i]['x'] = target.x
                         t_radar[i]['y'] = target.y
